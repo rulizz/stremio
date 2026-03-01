@@ -13,8 +13,10 @@ async function getImdbTitle(imdbId, type) {
       "https://cinemeta-live.strem.io/meta/" + type + "/" + imdbId + ".json",
       { timeout: 8000 }
     );
-    return resp.data && resp.data.meta ? resp.data.meta.name : null;
-  } catch (e) { return null; }
+    const meta = resp.data && resp.data.meta;
+    if (!meta) return { title: null, year: null };
+    return { title: meta.name || null, year: meta.year || null };
+  } catch (e) { return { title: null, year: null }; }
 }
 
 // ── Credentials ───────────────────────────────────────────────────────────────

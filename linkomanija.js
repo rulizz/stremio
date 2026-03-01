@@ -107,33 +107,23 @@ async function login(username, password) {
 
 // ── Search ────────────────────────────────────────────────────────────────────
 // Score how well a torrent name matches the search query.
-// Returns 0 if it's clearly irrelevant, higher = better match.
+// Returns 0 if irrelevant (doesn't contain all search words), higher = better match.
+// We do NOT filter by year or sequel numbers — return everything containing the words,
+// just like the LM website does. User sees same results as web search.
 function relevanceScore(torrentName, query) {
   const name = torrentName.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
   const q    = query.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
 
   const nameWords  = name.split(" ");
-  const queryWords = q.split(" ");
+  const queryWords = q.split(" ").filter(w => w.length > 0);
 
-  // All query words must appear in the torrent name
-  const allMatch = queryWords.every(w => nameWords.includes(w));
+  // All query words must appear somewhere in the torrent name
+  const allMatch = queryWords.every(w => nameWords.some(nw => nw.includes(w)));
   if (!allMatch) return 0;
 
-  // Penalize if torrent name has extra "story" words suggesting a different entry
-  // e.g. query="toy story 2" should not match "toy story 1" or "toy story 3"
-  // Check if there's a number in the query — if so, the torrent must have the same number
-  const queryNums = queryWords.filter(w => /^\d+$/.test(w));
-  if (queryNums.length > 0) {
-    const nameNums = nameWords.filter(w => /^\d+$/.test(w));
-    // torrent must contain all query numbers
-    const hasAllNums = queryNums.every(n => nameNums.includes(n));
-    if (!hasAllNums) return 0;
-  }
-
-  // Bonus: torrent name starts with the query words (very strong match)
+  // Score: bonus if name starts with query, small penalty for extra words
   const startsWithQuery = name.startsWith(q);
-  const lengthPenalty = Math.max(0, nameWords.length - queryWords.length); // fewer extra words = better
-
+  const lengthPenalty = Math.max(0, nameWords.length - queryWords.length);
   return 100 + (startsWithQuery ? 50 : 0) - lengthPenalty;
 }
 
