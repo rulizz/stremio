@@ -281,7 +281,7 @@ app.get("/debug", async (req, res) => {
   }
 });
 
-// ── Proxy test — open this in your browser to check the torrent download ──────
+// ── Proxy test ────────────────────────────────────────────────────────────────
 app.get("/proxy-test/:token/:torrentId", async (req, res) => {
   const { token, torrentId } = req.params;
   const creds = decodeCredentials(token);
@@ -304,45 +304,36 @@ app.get("/proxy-test/:token/:torrentId", async (req, res) => {
 
     const data = Buffer.from(resp.data);
     const contentType = resp.headers["content-type"] || "unknown";
-    const first20 = data.slice(0, 20).toString("utf8").replace(/[^\x20-\x7E]/g, ".");
+    const first30 = data.slice(0, 30).toString("latin1").replace(/[^\x20-\x7E]/g, ".");
+    const isHtml = contentType.includes("html") || data.toString("utf8", 0, 50).includes("<html");
+    const isValid = data.length > 200 && !isHtml;
 
-    res.send(`
-      <html><head><style>body{font-family:monospace;background:#111;color:#eee;padding:20px}
-      .good{color:#22c55e}.bad{color:#f87171}.warn{color:#f5a623}
-      pre{background:#1a1a1a;padding:12px;border-radius:6px}</style></head><body>
-      <h2 style="color:#f5a623">🔍 Proxy Test — Torrent ID: ${torrentId}</h2>
-      <p><b>Download URL:</b> <span style="color:#60a5fa">${dlUrl}</span></p>
-      <p><b>Response size:</b> ${data.length} bytes</p>
-      <p><b>Content-Type:</b> ${contentType}</p>
-      <p><b>First 20 bytes:</b> <code>${first20}</code></p>
-      <p class="${data.length > 100 && !contentType.includes("html") ? "good" : "bad"}">
-        ${data.length > 100 && !contentType.includes("html")
-          ? "✅ Looks like a valid torrent file"
-          : "❌ Got HTML or empty response — session/passkey issue"}
-      </p>
-      ${contentType.includes("html")
-        ? `<h3 class="bad">⚠️ LM returned HTML (login page redirect)</h3>
-           <pre>${data.toString("utf8").substring(0, 2000).replace(/</g,"&lt;")}</pre>`
-        : `<p class="good">✅ Binary data received — torrent file looks valid</p>
-           <p>Try downloading it: <a style="color:#60a5fa" href="/torrent-proxy/${token}/${torrentId}">Download .torrent</a></p>`
+    res.send(`<!DOCTYPE html><html><head><style>
+      body{font-family:monospace;background:#111;color:#eee;padding:20px}
+      .good{color:#22c55e}.bad{color:#f87171}
+      pre{background:#1a1a1a;padding:12px;border-radius:6px;overflow-x:auto;font-size:12px;white-space:pre-wrap;word-break:break-all}
+      table{border-collapse:collapse;margin:1rem 0}td{padding:6px 12px;border:1px solid #333}
+    </style></head><body>
+      <h2 style="color:#f5a623">Proxy Test id=${torrentId}</h2>
+      <table>
+        <tr><td>URL</td><td style="color:#60a5fa">${dlUrl}</td></tr>
+        <tr><td>Content-Type</td><td>${contentType}</td></tr>
+        <tr><td>Size</td><td>${data.length} bytes</td></tr>
+        <tr><td>Passkey</td><td>${session.passkey ? "YES " + session.passkey.substring(0,8) + "..." : "NOT FOUND"}</td></tr>
+        <tr><td>First 30 bytes</td><td><code>${first30}</code></td></tr>
+        <tr><td>Verdict</td><td class="${isValid ? "good" : "bad"}">${isValid ? "VALID TORRENT" : "HTML OR EMPTY - LOGIN REDIRECT"}</td></tr>
+      </table>
+      ${isHtml
+        ? "<h3>LM returned HTML:</h3><pre>" + data.toString("utf8").substring(0, 3000).replace(/</g,"&lt;") + "</pre>"
+        : isValid
+          ? "<p class=\"good\">File looks good! <a style=\"color:#60a5fa\" href=\"/torrent-proxy/" + token + "/" + torrentId + "\">Download it</a></p>"
+          : "<pre>" + data.toString("utf8").substring(0, 1000) + "</pre>"
       }
-      </body></html>
-    `);
+    </body></html>`);
   } catch (err) {
-    res.send(`<b style="color:red">Error: ${err.message}</b><pre>${err.stack}</pre>`);
+    res.send("<b style=\"color:red\">Error: " + err.message + "</b><pre>" + err.stack + "</pre>");
   }
 });
-```
-
----
-
-Then to use it:
-
-**Step 1** — Find a torrent ID. From your debug page, look at the raw HTML — you can see `id=916972` in the download link. Pick any ID from your results.
-
-**Step 2** — Open this in your browser:
-```
-https://your-addon.onrender.com/proxy-test/YOUR_TOKEN/916972
 
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => res.json({ status: "ok", addonUrl: ADDON_URL }));
