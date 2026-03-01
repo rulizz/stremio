@@ -14,8 +14,8 @@ const BROWSE_URL = `${BASE_URL}/browse.php`;
 const sessionCache = new NodeCache({ stdTTL: 28800, checkperiod: 600 });
 const searchCache = new NodeCache({ stdTTL: 900, checkperiod: 120 });
 
-const MOVIE_CATS = [1, 2, 3, 22, 23, 42];
-const TV_CATS    = [7, 8, 9, 24, 25];
+const MOVIE_CATS = [52, 61];
+const TV_CATS    = [28, 62];
 
 function createClient() {
   const jar = new CookieJar();
