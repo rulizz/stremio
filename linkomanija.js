@@ -106,6 +106,37 @@ async function login(username, password) {
 }
 
 // ── Search ────────────────────────────────────────────────────────────────────
+// Score how well a torrent name matches the search query.
+// Returns 0 if it's clearly irrelevant, higher = better match.
+function relevanceScore(torrentName, query) {
+  const name = torrentName.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+  const q    = query.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+
+  const nameWords  = name.split(" ");
+  const queryWords = q.split(" ");
+
+  // All query words must appear in the torrent name
+  const allMatch = queryWords.every(w => nameWords.includes(w));
+  if (!allMatch) return 0;
+
+  // Penalize if torrent name has extra "story" words suggesting a different entry
+  // e.g. query="toy story 2" should not match "toy story 1" or "toy story 3"
+  // Check if there's a number in the query — if so, the torrent must have the same number
+  const queryNums = queryWords.filter(w => /^\d+$/.test(w));
+  if (queryNums.length > 0) {
+    const nameNums = nameWords.filter(w => /^\d+$/.test(w));
+    // torrent must contain all query numbers
+    const hasAllNums = queryNums.every(n => nameNums.includes(n));
+    if (!hasAllNums) return 0;
+  }
+
+  // Bonus: torrent name starts with the query words (very strong match)
+  const startsWithQuery = name.startsWith(q);
+  const lengthPenalty = Math.max(0, nameWords.length - queryWords.length); // fewer extra words = better
+
+  return 100 + (startsWithQuery ? 50 : 0) - lengthPenalty;
+}
+
 async function search(session, query, type = "movie", cats = [61, 53]) {
   const cacheKey = `search:${session.username}:${type}:${query}:${cats.join(",")}`;
   if (searchCache.has(cacheKey)) {
@@ -113,22 +144,31 @@ async function search(session, query, type = "movie", cats = [61, 53]) {
     return searchCache.get(cacheKey);
   }
 
-  const catParams = cats.map(c => "cat=" + c).join("&");
+  // LM supports multi-category in one request using c{ID}=1 format
+  // e.g. browse.php?c53=1&c61=1&search=...
+  const catParams = cats.map(c => "c" + c + "=1").join("&");
   const url = `${BROWSE_URL}?${catParams}&search=${encodeURIComponent(query)}&searchin=1&incldead=0`;
   console.log(`[SEARCH] ${url}`);
 
-  let html = "";
+  let allResults = [];
   try {
     const resp = await session.client.get(url);
-    html = resp.data;
-    console.log(`[SEARCH] ${html.length} bytes`);
+    allResults = parseTorrentRows(resp.data, session.passkey);
+    console.log(`[SEARCH] ${allResults.length} rows from single request`);
   } catch (err) {
-    console.error("[SEARCH] HTTP error:", err.message);
-    return [];
+    console.error("[SEARCH] error:", err.message);
   }
 
-  const results = parseTorrentRows(html, session.passkey);
-  console.log(`[SEARCH] ${results.length} torrents for "${query}"`);
+  // Filter by relevance — only keep results that actually match the query
+  const scored = allResults
+    .map(t => ({ t, score: relevanceScore(t.name, query) }))
+    .filter(x => x.score > 0);
+
+  console.log(`[SEARCH] ${allResults.length} total → ${scored.length} relevant for "${query}"`);
+
+  // Return sorted by relevance score (buildStreams will re-sort by user prefs)
+  const results = scored.sort((a, b) => b.score - a.score).map(x => x.t);
+
   searchCache.set(cacheKey, results);
   return results;
 }
@@ -136,7 +176,7 @@ async function search(session, query, type = "movie", cats = [61, 53]) {
 // ── Debug ─────────────────────────────────────────────────────────────────────
 async function debugSearch(session, query, cats) {
   // Categories: 61 = Movies LT, 53 = Movies EN (verified working)
-  const catParams = (cats || [61,53]).map(c => "cat=" + c).join("&");
+  const catParams = (cats || [61,53]).map(c => "c" + c + "=1").join("&");
   const url = `${BROWSE_URL}?${catParams}&search=${encodeURIComponent(query)}&searchin=1&incldead=0`;
   const resp = await session.client.get(url);
   return { html: resp.data, url };
