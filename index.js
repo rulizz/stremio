@@ -397,9 +397,9 @@ app.get("/:token/stream/:type/:id.json", async (req, res) => {
 
   try {
     const session = await login(creds.username, creds.password);
-    const title = await getImdbTitle(imdbId, type);
+    const { title, year } = await getImdbTitle(imdbId, type);
     if (!title) { console.warn("[IMDB] No title for " + imdbId); return res.json({ streams: [] }); }
-    console.log("[IMDB] " + title);
+    console.log("[IMDB] " + title + (year ? " (" + year + ")" : ""));
 
     const cats = creds.cats || [61, 53];
     const sortBy = Array.isArray(creds.sortBy) ? creds.sortBy : (creds.sortBy || "seeds").split(",");
