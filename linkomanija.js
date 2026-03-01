@@ -37,8 +37,8 @@ const sessionCache = new NodeCache({ stdTTL: 28800, checkperiod: 600 });
 const searchCache = new NodeCache({ stdTTL: 900, checkperiod: 120 });
 
 // ── Category mapping ─────────────────────────────────────────────────────────
-const MOVIE_CATS = [1, 2, 3, 22, 23, 42]; // SD, HD, 4K, foreign, etc.
-const TV_CATS    = [7, 8, 9, 24, 25];      // TV SD, HD, 4K, foreign
+const MOVIE_CATS = [61, 53]; // SD, HD, 4K, foreign, etc.
+const TV_CATS    = [62];      // TV SD, HD, 4K, foreign
 
 /**
  * Create a fresh axios instance with a cookie jar bound to this user session.
