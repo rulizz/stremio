@@ -75,8 +75,10 @@ function buildMagnet(infoHash, name) {
 }
 
 // ── Build stream list ─────────────────────────────────────────────────────────
-function buildStreams(torrents, title, token) {
+// torrents must already have t.magnet resolved before calling this
+function buildStreams(torrents, title) {
   return torrents
+    .filter(t => t.magnet) // only include torrents where magnet was resolved
     .sort((a, b) => {
       if (a.freeleech !== b.freeleech) return b.freeleech ? 1 : -1;
       const q = s => s.includes("4K") ? 4 : s.includes("1080") ? 3 : s.includes("720") ? 2 : 1;
@@ -87,11 +89,51 @@ function buildStreams(torrents, title, token) {
     .map(t => ({
       name: "LT Linkomanija\n" + t.quality + (t.freeleech ? " FL" : ""),
       description: t.name + "\n" + (t.size || "?") + " | Seeds: " + t.seeders + " | Leech: " + t.leechers,
-      // Point to our magnet endpoint — server downloads .torrent, returns magnet:// URI
-      url: ADDON_URL + "/magnet/" + token + "/" + t.id + "/" + encodeURIComponent(t.name),
+      url: t.magnet, // direct magnet URI — Stremio handles this natively
       behaviorHints: { notWebReady: true, bingeGroup: "lm-" + title },
-    }))
-    .slice(0, 20);
+    }));
+}
+
+// ── Resolve magnets for a list of torrents ────────────────────────────────────
+async function resolveMagnets(session, torrents) {
+  // Download all .torrent files in parallel (max 5 at a time to avoid hammering LM)
+  const BATCH = 5;
+  const results = [...torrents];
+
+  for (let i = 0; i < results.length; i += BATCH) {
+    const batch = results.slice(i, i + BATCH);
+    await Promise.all(batch.map(async t => {
+      try {
+        let dlUrl = "https://www.linkomanija.net/download.php?id=" + t.id;
+        if (session.passkey) dlUrl += "&passkey=" + session.passkey;
+
+        const resp = await session.client.get(dlUrl, {
+          responseType: "arraybuffer",
+          maxRedirects: 10,
+          timeout: 15000,
+          headers: {
+            Accept: "application/x-bittorrent, application/octet-stream, */*",
+            Referer: "https://www.linkomanija.net/browse.php",
+          },
+        });
+
+        const data = Buffer.from(resp.data);
+        const ct = resp.headers["content-type"] || "";
+        if (ct.includes("text/html") || data.length < 100) {
+          console.warn("[MAGNET] id=" + t.id + " got HTML — skipping");
+          return;
+        }
+
+        const infoHash = extractInfoHash(data);
+        t.magnet = buildMagnet(infoHash, t.name);
+        console.log("[MAGNET] id=" + t.id + " hash=" + infoHash.substring(0, 8) + "...");
+      } catch (err) {
+        console.warn("[MAGNET] id=" + t.id + " failed: " + err.message);
+      }
+    }));
+  }
+
+  return results;
 }
 
 // ── Express ───────────────────────────────────────────────────────────────────
@@ -167,7 +209,12 @@ app.get("/:token/stream/:type/:id.json", async (req, res) => {
       if (results.length > 0) { console.log("[STREAM] " + results.length + " results for: " + query); break; }
     }
 
-    res.json({ streams: buildStreams(results, title, token) });
+    // Resolve magnet links for top results (limit to 10 to stay within timeout)
+    const topResults = results.slice(0, 10);
+    const withMagnets = await resolveMagnets(session, topResults);
+    const streams = buildStreams(withMagnets, title);
+    console.log("[STREAM] Returning " + streams.length + " streams with magnets");
+    res.json({ streams });
   } catch (err) {
     console.error("[STREAM ERROR]", err.message);
     if (err.message && err.message.toLowerCase().includes("login")) invalidateSession(creds.username);
