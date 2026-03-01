@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: lm-stremio-addon
+    runtime: node
+    buildCommand: npm install
+    startCommand: node index.js
+    plan: free
+    region: frankfurt
+    envVars:
+      - key: ADDON_URL
+        value: https://lm-stremio-addon.onrender.com
