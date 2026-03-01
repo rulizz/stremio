@@ -143,34 +143,52 @@ app.get("/:token/stream/:type/:id.json", async (req, res) => {
 });
 
 // ── Torrent proxy ─────────────────────────────────────────────────────────────
-// Stremio calls this URL. We fetch the .torrent file from LM using the
-// authenticated session (which has the right cookies) and pipe it back.
-// This solves the "playback error" — Stremio was getting a 403/redirect
-// because LM requires a logged-in session to download .torrent files.
+// Stremio calls this URL to get the .torrent file.
+// We fetch it using our authenticated LM session (cookie jar) and pipe it back.
+// Without this proxy, LM returns a login redirect instead of the .torrent file.
 app.get("/torrent-proxy/:token/:torrentId", async (req, res) => {
   const { token, torrentId } = req.params;
   const creds = decodeCredentials(token);
   if (!creds) return res.status(401).send("Invalid token");
 
-  console.log(`[PROXY] Fetching torrent id=${torrentId} for ${creds.username}`);
+  console.log(`[PROXY] id=${torrentId} user=${creds.username}`);
 
   try {
     const session = await login(creds.username, creds.password);
 
-    // Build the download URL, with passkey if available
+    // Use passkey in URL if available — some LM configs require it
     let dlUrl = `https://www.linkomanija.net/download.php?id=${torrentId}`;
     if (session.passkey) dlUrl += `&passkey=${session.passkey}`;
 
+    console.log(`[PROXY] Fetching: ${dlUrl}`);
+
     const torrentResp = await session.client.get(dlUrl, {
       responseType: "arraybuffer",
-      headers: { Accept: "application/x-bittorrent, */*" },
+      maxRedirects: 10,
+      headers: {
+        Accept: "application/x-bittorrent, application/octet-stream, */*",
+        Referer: "https://www.linkomanija.net/browse.php",
+      },
     });
 
-    // Forward the .torrent file to Stremio
+    const contentType = torrentResp.headers["content-type"] || "";
+    const data = Buffer.from(torrentResp.data);
+
+    console.log(`[PROXY] Got ${data.length} bytes, content-type: ${contentType}`);
+
+    // Check we got a real torrent (starts with "d8:" or "d" — bencoded data)
+    // If LM redirected to login page we'd get HTML instead
+    if (contentType.includes("text/html") || data.length < 100) {
+      console.error("[PROXY] Got HTML instead of torrent — session may have expired");
+      invalidateSession(creds.username);
+      return res.status(401).send("Session expired — please reinstall the addon");
+    }
+
     res.setHeader("Content-Type", "application/x-bittorrent");
     res.setHeader("Content-Disposition", `attachment; filename="${torrentId}.torrent"`);
-    res.send(Buffer.from(torrentResp.data));
-    console.log(`[PROXY] Served ${torrentResp.data.byteLength} bytes for id=${torrentId}`);
+    res.setHeader("Content-Length", data.length);
+    res.send(data);
+    console.log(`[PROXY] ✅ Served ${data.length} bytes for id=${torrentId}`);
   } catch (err) {
     console.error("[PROXY ERROR]", err.message);
     res.status(500).send("Failed to fetch torrent: " + err.message);
