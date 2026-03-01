@@ -18,8 +18,14 @@ async function getImdbTitle(imdbId, type) {
 }
 
 // ── Credentials ───────────────────────────────────────────────────────────────
-function encodeCredentials(username, password, rdKey) {
-  return Buffer.from(JSON.stringify({ username, password, rdKey: rdKey || "" })).toString("base64url");
+function encodeCredentials(username, password, rdKey, cats, sortBy) {
+  return Buffer.from(JSON.stringify({
+    username,
+    password,
+    rdKey: rdKey || "",
+    cats: cats || [61, 53],       // category IDs to search
+    sortBy: sortBy || ["rd","seeds","size","quality","fl"],
+  })).toString("base64url");
 }
 function decodeCredentials(token) {
   try { return JSON.parse(Buffer.from(token, "base64url").toString("utf8")); }
@@ -65,36 +71,56 @@ async function rdUnrestrictLink(rdKey, link) {
 }
 
 // Full flow: magnet → RD → direct stream URL
-// Returns array of { url, filename, filesize } or empty array if not ready
+// Returns array of { url, filename, filesize } or empty array if not ready yet.
+//
+// RD status flow:
+//   magnet_conversion → waiting → downloading → downloaded ✅
+//   or: cached ✅ (already on RD servers — instant)
 async function rdResolve(rdKey, magnet) {
   try {
     // Step 1: add magnet to RD
     const added = await rdAddMagnet(rdKey, magnet);
     const torrentId = added.id;
     if (!torrentId) throw new Error("No torrent ID from RD");
+    console.log("[RD] Added torrent id=" + torrentId);
 
-    // Step 2: select all files
+    // Step 2: select all files (required before RD starts processing)
     await rdSelectFiles(rdKey, torrentId);
 
-    // Step 3: poll for ready status (max 8 seconds)
+    // Step 3: poll for ready status
+    // RD can take 30-90 seconds for magnet conversion on first add.
+    // We poll for up to 25 seconds — if not ready we return [] and the
+    // magnet fallback is shown to the user. They can click again once RD
+    // has had time to process it (it stays in their RD account).
     let info;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      await new Promise(r => setTimeout(r, 2000));
+    const POLL_INTERVAL = 2500; // ms between polls
+    const MAX_POLLS = 10;       // 10 × 2.5s = 25 seconds max wait
+    for (let attempt = 0; attempt < MAX_POLLS; attempt++) {
+      await new Promise(r => setTimeout(r, POLL_INTERVAL));
       info = await rdGetTorrentInfo(rdKey, torrentId);
-      console.log("[RD] status=" + info.status + " id=" + torrentId);
-      if (info.status === "downloaded" || info.status === "cached") break;
-      if (info.status === "error" || info.status === "dead" || info.status === "magnet_error") {
-        throw new Error("RD torrent error: " + info.status);
+      console.log("[RD] poll " + (attempt+1) + "/" + MAX_POLLS + " status=" + info.status);
+
+      if (info.status === "downloaded") break;
+
+      // "cached" means RD already has this torrent — links are ready immediately
+      if (info.status === "cached") break;
+
+      // Fatal errors — no point retrying
+      if (["error", "dead", "magnet_error", "virus", "compressing", "uploading"].includes(info.status)) {
+        console.warn("[RD] terminal status: " + info.status);
+        return [];
       }
+      // magnet_conversion, waiting, downloading → keep polling
     }
 
     if (!info || !info.links || info.links.length === 0) {
-      console.log("[RD] Not cached yet, returning magnet as fallback");
+      console.log("[RD] Still processing after polling — torrent is queued in RD, magnet shown as fallback");
       return [];
     }
 
-    // Step 4: unrestrict the first video link
-    const videoLinks = info.links.slice(0, 3);
+    // Step 4: unrestrict links to get direct HTTPS video URLs
+    // Filter to likely video files by checking for video extensions
+    const videoLinks = info.links.slice(0, 5);
     const results = [];
     for (const link of videoLinks) {
       try {
@@ -107,9 +133,11 @@ async function rdResolve(rdKey, magnet) {
           });
         }
       } catch (e) {
-        console.warn("[RD] Unrestrict failed for link:", e.message);
+        console.warn("[RD] Unrestrict failed:", e.message);
       }
     }
+
+    console.log("[RD] Resolved " + results.length + " direct links for id=" + torrentId);
     return results;
   } catch (err) {
     console.error("[RD] resolve error:", err.message);
@@ -166,9 +194,81 @@ function buildMagnet(infoHash, name) {
 }
 
 // ── Build stream list ─────────────────────────────────────────────────────────
-function buildStreams(torrents, title) {
-  const streams = [];
+// Convert "2.45 GB" / "700 MB" → bytes for numeric sort
+function parseSize(sizeStr) {
+  if (!sizeStr) return 0;
+  const m = sizeStr.replace(/,/g, "").match(/([\d.]+)\s*(TB|GB|MB|KB)/i);
+  if (!m) return 0;
+  const n = parseFloat(m[1]);
+  const unit = m[2].toUpperCase();
+  if (unit === "TB") return n * 1e12;
+  if (unit === "GB") return n * 1e9;
+  if (unit === "MB") return n * 1e6;
+  if (unit === "KB") return n * 1e3;
+  return n;
+}
+
+const QUALITY_SCORE = s => {
+  if (!s) return 0;
+  const u = s.toUpperCase();
+  if (u.includes("4K") || u.includes("2160")) return 4;
+  if (u.includes("1080")) return 3;
+  if (u.includes("720")) return 2;
+  return 1;
+};
+
+function buildStreams(torrents, title, sortBy) {
+  const order = Array.isArray(sortBy) ? sortBy : ["rd", "seeds", "size", "quality", "fl"];
+
+  // Expand each torrent into entries: RD streams + magnet fallback
+  // We attach sort keys to each entry then sort the flat list
+  const entries = [];
   for (const t of torrents) {
+    if (!t.magnet) continue;
+    const base = {
+      _seeds: t.seeders || 0,
+      _size: parseSize(t.size),
+      _quality: QUALITY_SCORE(t.quality),
+      _fl: t.freeleech ? 1 : 0,
+      name: "LT Linkomanija\n" + t.quality + (t.freeleech ? " FL" : ""),
+      description: t.name + "\n" + (t.size || "?") + " | Seeds: " + t.seeders + " | Leech: " + t.leechers,
+      behaviorHints: { bingeGroup: "lm-" + title },
+    };
+
+    if (t.rdStreams && t.rdStreams.length > 0) {
+      for (const rd of t.rdStreams) {
+        entries.push(Object.assign({}, base, {
+          _rd: 1,
+          name: base.name + " RD",
+          description: base.description + "\n⚡ Real-Debrid — " + rd.filename,
+          url: rd.url,
+        }));
+      }
+    }
+
+    entries.push(Object.assign({}, base, { _rd: 0, url: t.magnet }));
+  }
+
+  // Sort by user-defined priority order
+  entries.sort((a, b) => {
+    for (const key of order) {
+      let diff = 0;
+      if (key === "rd")      diff = b._rd      - a._rd;
+      if (key === "seeds")   diff = b._seeds   - a._seeds;
+      if (key === "size")    diff = b._size    - a._size;
+      if (key === "quality") diff = b._quality - a._quality;
+      if (key === "fl")      diff = b._fl      - a._fl;
+      if (diff !== 0) return diff;
+    }
+    return 0;
+  });
+
+  // Strip internal sort keys before returning
+  return entries.map(({ _rd, _seeds, _size, _quality, _fl, ...stream }) => stream);
+
+
+  const streams = [];
+  for (const t of sorted) {
     if (!t.magnet) continue;
     const label = "LT Linkomanija\n" + t.quality + (t.freeleech ? " FL" : "");
     const desc = t.name + "\n" + (t.size || "?") + " | Seeds: " + t.seeders + " | Leech: " + t.leechers;
@@ -251,9 +351,12 @@ app.use((req, res, next) => {
 app.get("/", (req, res) => res.redirect("/configure"));
 app.get("/configure", (req, res) => res.send(configurePage()));
 app.post("/configure", (req, res) => {
-  const { username, password, rdKey } = req.body;
+  const { username, password, rdKey, cats, sortBy } = req.body;
   if (!username || !password) return res.send(configurePage("Username and password are required."));
-  const token = encodeCredentials(username.trim(), password, (rdKey || "").trim());
+  // cats comes as comma-separated string "61,53" from the form
+  const catList = (cats || "61,53").split(",").map(c => parseInt(c.trim(), 10)).filter(n => !isNaN(n) && n > 0);
+  const sortList = (sortBy || "rd,seeds,size,quality,fl").split(",").map(s => s.trim()).filter(Boolean);
+  const token = encodeCredentials(username.trim(), password, (rdKey || "").trim(), catList, sortList);
   const manifestUrl = ADDON_URL + "/" + token + "/manifest.json";
   const host = new URL(ADDON_URL).host;
   const stremioUrl = "stremio://" + host + "/" + token + "/manifest.json";
@@ -296,6 +399,9 @@ app.get("/:token/stream/:type/:id.json", async (req, res) => {
     if (!title) { console.warn("[IMDB] No title for " + imdbId); return res.json({ streams: [] }); }
     console.log("[IMDB] " + title);
 
+    const cats = creds.cats || [61, 53];
+    const sortBy = Array.isArray(creds.sortBy) ? creds.sortBy : (creds.sortBy || "seeds").split(",");
+
     const queries = [];
     if (type === "series" && season && episode) {
       const s = String(season).padStart(2, "0");
@@ -307,7 +413,7 @@ app.get("/:token/stream/:type/:id.json", async (req, res) => {
 
     let results = [];
     for (const query of queries) {
-      results = await search(session, query, type);
+      results = await search(session, query, type, cats);
       if (results.length > 0) { console.log("[STREAM] " + results.length + " results for: " + query); break; }
     }
 
@@ -329,7 +435,7 @@ app.get("/:token/stream/:type/:id.json", async (req, res) => {
       );
     }
 
-    const streams = buildStreams(withMagnets, title);
+    const streams = buildStreams(withMagnets, title, sortBy);
     console.log("[STREAM] Returning " + streams.length + " streams");
     res.json({ streams });
   } catch (err) {
@@ -541,45 +647,230 @@ app.listen(PORT, () => {
 // ── HTML pages ────────────────────────────────────────────────────────────────
 function configurePage(error) {
   error = error || "";
-  return "<!DOCTYPE html><html lang='en'><head>" +
-    "<meta charset='UTF-8'/><meta name='viewport' content='width=device-width,initial-scale=1.0'/>" +
-    "<title>Linkomanija Stremio Addon</title>" +
-    "<link href='https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500&display=swap' rel='stylesheet'/>" +
-    "<style>*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}" +
-    ":root{--bg:#0b0d0f;--surface:#13161a;--border:#1e2328;--accent:#e8342a;--accent2:#f5a623;--text:#e8e6e1;--muted:#6b7280}" +
-    "body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:2rem}" +
-    "body::before{content:'';position:fixed;top:-30%;left:-10%;width:60%;height:60%;background:radial-gradient(ellipse,rgba(232,52,42,.12) 0%,transparent 70%);pointer-events:none;z-index:0}" +
-    ".card{position:relative;z-index:1;background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:3rem;width:100%;max-width:460px;box-shadow:0 32px 80px rgba(0,0,0,.6);animation:fadeUp .5s ease both}" +
-    "@keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}" +
-    ".logo-row{display:flex;align-items:center;gap:1rem;margin-bottom:2.5rem}.flag{font-size:2rem}" +
-    ".brand h1{font-family:'Bebas Neue',sans-serif;font-size:2.2rem;letter-spacing:.06em;line-height:1}" +
-    ".brand p{font-size:.78rem;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;margin-top:2px}" +
-    ".divider{height:1px;background:var(--border);margin:0 0 2rem}" +
-    "label{display:block;font-size:.75rem;font-weight:500;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:.5rem}" +
-    "input{width:100%;background:#0b0d0f;border:1px solid var(--border);border-radius:8px;padding:.85rem 1rem;color:var(--text);font-family:'DM Sans',sans-serif;font-size:.95rem;outline:none;transition:border-color .2s;margin-bottom:1.25rem}" +
-    "input:focus{border-color:var(--accent)}input::placeholder{color:#3a3f47}" +
-    "button[type=submit]{width:100%;background:var(--accent);color:#fff;border:none;border-radius:8px;padding:.9rem;font-family:'Bebas Neue',sans-serif;font-size:1.1rem;letter-spacing:.1em;cursor:pointer;margin-top:.5rem}" +
-    "button[type=submit]:hover{background:#c42720}" +
-    ".error{background:rgba(232,52,42,.1);border:1px solid rgba(232,52,42,.3);border-radius:8px;padding:.75rem 1rem;font-size:.875rem;color:#f87171;margin-bottom:1.5rem}" +
-    ".note{font-size:.78rem;color:var(--muted);text-align:center;margin-top:1.5rem;line-height:1.6}" +
-    ".note a{color:var(--accent2);text-decoration:none}" +
-    ".badge{display:inline-flex;background:rgba(245,166,35,.12);border:1px solid rgba(245,166,35,.2);color:var(--accent2);font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;padding:3px 8px;border-radius:99px;margin-bottom:1.5rem}" +
-    "</style></head><body>" +
-    "<div class='card'>" +
-    "<div class='logo-row'><span class='flag'>🇱🇹</span><div class='brand'><h1>Linkomanija</h1><p>Stremio Addon</p></div></div>" +
-    "<span class='badge'>🔒 Credentials stay in your Stremio URL</span>" +
-    "<div class='divider'></div>" +
-    (error ? "<div class='error'>" + error + "</div>" : "") +
-    "<form method='POST' action='/configure'>" +
-    "<label>Username</label><input type='text' name='username' placeholder='your_username' autocomplete='username' required/>" +
-    "<label>Password</label><input type='password' name='password' placeholder='••••••••' autocomplete='current-password' required/>" +
-    "<label>Real-Debrid API Key <span style=\'font-weight:300;text-transform:none\'>— optional, for instant streaming</span></label>" +
-    "<input type='text' name='rdKey' placeholder='your RD API key (real-debrid.com/apitoken)'/>" +
-    "<button type='submit'>Generate My Addon URL →</button>" +
-    "</form>" +
-    "<p class='note'>Requires <a href='https://www.linkomanija.net' target='_blank'>Linkomanija.net</a> account.<br/>Credentials encoded in URL — never stored.</p>" +
-    "</div></body></html>";
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Linkomanija · Stremio Addon</title>
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"/>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    :root{--bg:#0b0d0f;--surface:#13161a;--card:#161a1f;--border:#1e2328;--accent:#e8342a;--accent2:#f5a623;--green:#22c55e;--text:#e8e6e1;--muted:#6b7280}
+    body{background:var(--bg);color:var(--text);font-family:"DM Sans",sans-serif;min-height:100vh;display:flex;align-items:flex-start;justify-content:center;padding:2rem}
+    body::before{content:"";position:fixed;top:-20%;left:-10%;width:55%;height:55%;background:radial-gradient(ellipse,rgba(232,52,42,.1) 0%,transparent 70%);pointer-events:none;z-index:0}
+    .wrap{position:relative;z-index:1;width:100%;max-width:560px;animation:fadeUp .45s ease both}
+    @keyframes fadeUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+
+    /* Header */
+    .header{display:flex;align-items:center;gap:1rem;margin-bottom:2rem}
+    .header h1{font-family:"Bebas Neue",sans-serif;font-size:2.4rem;letter-spacing:.06em;line-height:1}
+    .header p{font-size:.75rem;color:var(--muted);letter-spacing:.1em;text-transform:uppercase;margin-top:3px}
+
+    /* Section cards */
+    .section{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;margin-bottom:1rem}
+    .section-title{font-size:.65rem;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:1.25rem;display:flex;align-items:center;gap:.5rem}
+    .section-title::after{content:"";flex:1;height:1px;background:var(--border)}
+
+    /* Form fields */
+    .field{margin-bottom:1rem}
+    .field:last-child{margin-bottom:0}
+    .field label{display:block;font-size:.72rem;font-weight:500;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);margin-bottom:.45rem}
+    .field label span{text-transform:none;font-weight:300;letter-spacing:0;color:#4b5563}
+    input[type=text],input[type=password]{width:100%;background:#0b0d0f;border:1px solid var(--border);border-radius:8px;padding:.8rem 1rem;color:var(--text);font-family:"DM Sans",sans-serif;font-size:.9rem;outline:none;transition:border-color .2s,box-shadow .2s}
+    input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(232,52,42,.12)}
+    input::placeholder{color:#2e333a}
+
+    /* Category builder */
+    .cat-list{display:flex;flex-direction:column;gap:.5rem;margin-bottom:.75rem}
+    .cat-row{display:flex;align-items:center;gap:.5rem}
+    .cat-row input[type=number]{width:90px;padding:.55rem .75rem;font-size:.85rem;flex-shrink:0}
+    .cat-row input[type=text]{flex:1;padding:.55rem .75rem;font-size:.85rem}
+    .cat-row .del{background:transparent;border:1px solid #2e333a;border-radius:6px;color:var(--muted);width:32px;height:32px;cursor:pointer;font-size:1rem;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:border-color .2s,color .2s}
+    .cat-row .del:hover{border-color:#f87171;color:#f87171}
+    .add-cat{background:transparent;border:1px dashed #2e333a;border-radius:8px;color:var(--muted);font-size:.8rem;padding:.55rem 1rem;cursor:pointer;width:100%;transition:border-color .2s,color .2s;font-family:"DM Sans",sans-serif}
+    .add-cat:hover{border-color:var(--accent2);color:var(--accent2)}
+    .cat-hint{font-size:.72rem;color:#3d4450;margin-top:.5rem;line-height:1.5}
+    .cat-hint a{color:#4b5563;text-decoration:none}
+    .cat-hint a:hover{color:var(--accent2)}
+
+    /* Sort order drag list */
+    .sort-list{display:flex;flex-direction:column;gap:.4rem;margin-bottom:.5rem}
+    .sort-item{display:flex;align-items:center;gap:.75rem;background:#0b0d0f;border:1px solid var(--border);border-radius:8px;padding:.65rem .9rem;cursor:grab;user-select:none;transition:border-color .2s,background .15s}
+    .sort-item:active{cursor:grabbing}
+    .sort-item.dragging{opacity:.4}
+    .sort-item.drag-over{border-color:var(--accent2);background:#161200}
+    .sort-handle{color:#2e333a;font-size:1rem;flex-shrink:0}
+    .sort-badge{font-size:.7rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;padding:2px 7px;border-radius:4px;flex-shrink:0}
+    .badge-rd{background:rgba(34,197,94,.15);color:var(--green)}
+    .badge-seeds{background:rgba(96,165,250,.15);color:#60a5fa}
+    .badge-size{background:rgba(167,139,250,.15);color:#a78bfa}
+    .badge-quality{background:rgba(245,166,35,.15);color:var(--accent2)}
+    .badge-fl{background:rgba(232,52,42,.15);color:var(--accent)}
+    .sort-desc{font-size:.8rem;color:var(--text);flex:1}
+    .sort-subdesc{font-size:.7rem;color:var(--muted);margin-top:1px}
+    .sort-hint{font-size:.72rem;color:#3d4450;margin-top:.4rem}
+
+    /* Submit */
+    .submit-btn{width:100%;background:var(--accent);color:#fff;border:none;border-radius:10px;padding:1rem;font-family:"Bebas Neue",sans-serif;font-size:1.15rem;letter-spacing:.1em;cursor:pointer;transition:background .2s;margin-top:.5rem}
+    .submit-btn:hover{background:#c42720}
+    .error-box{background:rgba(232,52,42,.08);border:1px solid rgba(232,52,42,.25);border-radius:8px;padding:.75rem 1rem;font-size:.85rem;color:#f87171;margin-bottom:1rem}
+    .note{font-size:.75rem;color:#3d4450;text-align:center;margin-top:1rem;line-height:1.7}
+    .note a{color:#4b5563;text-decoration:none}
+    .note a:hover{color:var(--accent2)}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="header">
+    <span style="font-size:2.5rem">🇱🇹</span>
+    <div><h1>Linkomanija</h1><p>Stremio Addon · Configure</p></div>
+  </div>
+
+  ${error ? `<div class="error-box">⚠ ${error}</div>` : ""}
+
+  <form method="POST" action="/configure" onsubmit="prepareForm(event)">
+
+    <!-- ── Account ── -->
+    <div class="section">
+      <div class="section-title">Account</div>
+      <div class="field">
+        <label>Linkomanija Username</label>
+        <input type="text" name="username" placeholder="your_username" autocomplete="username" required/>
+      </div>
+      <div class="field">
+        <label>Password</label>
+        <input type="password" name="password" placeholder="••••••••" autocomplete="current-password" required/>
+      </div>
+    </div>
+
+    <!-- ── Real-Debrid ── -->
+    <div class="section">
+      <div class="section-title">Real-Debrid <span style="text-transform:none;font-weight:300;letter-spacing:0;color:#3d4450;font-size:.6rem;margin-left:.25rem">— optional</span></div>
+      <div class="field">
+        <label>API Key <span>— enables instant streaming via Real-Debrid</span></label>
+        <input type="text" name="rdKey" placeholder="Get yours at real-debrid.com/apitoken"/>
+      </div>
+    </div>
+
+    <!-- ── Categories ── -->
+    <div class="section">
+      <div class="section-title">Categories to Search</div>
+      <div class="cat-list" id="catList"></div>
+      <button type="button" class="add-cat" onclick="addCat()">+ Add category</button>
+      <input type="hidden" name="cats" id="catsInput"/>
+      <p class="cat-hint">
+        Find category IDs by browsing <a href="https://www.linkomanija.net/browse.php" target="_blank">linkomanija.net/browse.php</a>
+        — the number after <code>cat=</code> in the URL is the ID.<br/>
+        Example: <code>browse.php?cat=61</code> → ID is <strong>61</strong>
+      </p>
+    </div>
+
+    <!-- ── Stream Sort Order ── -->
+    <div class="section">
+      <div class="section-title">Stream Sort Order</div>
+      <p style="font-size:.78rem;color:var(--muted);margin-bottom:.75rem">Drag to reorder — top item sorts first</p>
+      <div class="sort-list" id="sortList"></div>
+      <input type="hidden" name="sortBy" id="sortByInput"/>
+      <p class="sort-hint">Drag the criteria into the priority order you prefer. All enabled criteria are used — first one breaks ties with the next.</p>
+    </div>
+
+    <button type="submit" class="submit-btn">Generate My Addon URL →</button>
+  </form>
+
+  <p class="note">
+    Credentials are encoded in your URL only — never stored on this server.<br/>
+    <a href="https://www.linkomanija.net" target="_blank">linkomanija.net</a> account required.
+  </p>
+</div>
+
+<script>
+// ── Default categories ──────────────────────────────────────────────────────
+const DEFAULT_CATS = [
+  { id: 61, label: "Movies LT" },
+  { id: 53, label: "Movies EN" },
+];
+
+function addCat(id, label) {
+  const list = document.getElementById("catList");
+  const row = document.createElement("div");
+  row.className = "cat-row";
+  row.innerHTML =
+    "<input type='number' placeholder='ID' value='" + (id || "") + "' min='1' max='999'/>" +
+    "<input type='text' placeholder='Label (optional)' value='" + (label || "") + "'/>" +
+    "<button type='button' class='del' onclick='this.parentElement.remove()' title='Remove'>×</button>";
+  list.appendChild(row);
 }
+
+DEFAULT_CATS.forEach(c => addCat(c.id, c.label));
+
+// ── Sort criteria ───────────────────────────────────────────────────────────
+const SORT_CRITERIA = [
+  { key: "rd",      badge: "RD",      badgeClass: "badge-rd",      label: "Real-Debrid first",  sub: "Cached/direct streams appear above magnet fallbacks" },
+  { key: "seeds",   badge: "Seeds",   badgeClass: "badge-seeds",   label: "Most seeders",       sub: "Higher seed count = more reliable download" },
+  { key: "size",    badge: "Size",    badgeClass: "badge-size",    label: "Largest file",       sub: "Bigger file usually means better quality" },
+  { key: "quality", badge: "Quality", badgeClass: "badge-quality", label: "Best quality",       sub: "4K > 1080p > 720p > SD" },
+  { key: "fl",      badge: "FL",      badgeClass: "badge-fl",      label: "Freeleech first",    sub: "Freeleech torrents don't count against your ratio" },
+];
+
+let sortOrder = ["rd", "seeds", "size", "quality", "fl"];
+let dragSrc = null;
+
+function renderSortList() {
+  const list = document.getElementById("sortList");
+  list.innerHTML = "";
+  sortOrder.forEach((key, i) => {
+    const c = SORT_CRITERIA.find(x => x.key === key);
+    if (!c) return;
+    const el = document.createElement("div");
+    el.className = "sort-item";
+    el.draggable = true;
+    el.dataset.key = key;
+    el.innerHTML =
+      "<span class='sort-handle'>⠿</span>" +
+      "<span class='sort-badge " + c.badgeClass + "'>" + c.badge + "</span>" +
+      "<div><div class='sort-desc'>" + c.label + "</div><div class='sort-subdesc'>" + c.sub + "</div></div>";
+
+    el.addEventListener("dragstart", e => { dragSrc = el; el.classList.add("dragging"); e.dataTransfer.effectAllowed = "move"; });
+    el.addEventListener("dragend", () => { el.classList.remove("dragging"); document.querySelectorAll(".sort-item").forEach(x => x.classList.remove("drag-over")); });
+    el.addEventListener("dragover", e => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; el.classList.add("drag-over"); });
+    el.addEventListener("dragleave", () => el.classList.remove("drag-over"));
+    el.addEventListener("drop", e => {
+      e.preventDefault();
+      el.classList.remove("drag-over");
+      if (dragSrc === el) return;
+      const keys = [...document.querySelectorAll(".sort-item")].map(x => x.dataset.key);
+      const fromIdx = keys.indexOf(dragSrc.dataset.key);
+      const toIdx = keys.indexOf(el.dataset.key);
+      sortOrder.splice(fromIdx, 1);
+      sortOrder.splice(toIdx, 0, dragSrc.dataset.key);
+      renderSortList();
+    });
+
+    list.appendChild(el);
+  });
+}
+
+renderSortList();
+
+// ── Form submission ─────────────────────────────────────────────────────────
+function prepareForm(e) {
+  // Collect category IDs
+  const rows = document.querySelectorAll(".cat-row");
+  const ids = [];
+  rows.forEach(row => {
+    const idVal = parseInt(row.querySelector("input[type=number]").value, 10);
+    if (!isNaN(idVal) && idVal > 0) ids.push(idVal);
+  });
+  if (ids.length === 0) { e.preventDefault(); alert("Add at least one category."); return; }
+  document.getElementById("catsInput").value = ids.join(",");
+  document.getElementById("sortByInput").value = sortOrder.join(",");
+}
+</script>
+</body>
+</html>`;
+}
+
 
 function successPage(manifestUrl, stremioUrl, username) {
   return "<!DOCTYPE html><html><head><meta charset='UTF-8'/><title>Linkomanija Ready</title>" +

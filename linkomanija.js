@@ -106,14 +106,15 @@ async function login(username, password) {
 }
 
 // ── Search ────────────────────────────────────────────────────────────────────
-async function search(session, query, type = "movie") {
-  const cacheKey = `search:${session.username}:${type}:${query}`;
+async function search(session, query, type = "movie", cats = [61, 53]) {
+  const cacheKey = `search:${session.username}:${type}:${query}:${cats.join(",")}`;
   if (searchCache.has(cacheKey)) {
     console.log(`[SEARCH] Cache hit: "${query}"`);
     return searchCache.get(cacheKey);
   }
 
-  const url = `${BROWSE_URL}?search=${encodeURIComponent(query)}&searchin=1&incldead=0`;
+  const catParams = cats.map(c => "cat=" + c).join("&");
+  const url = `${BROWSE_URL}?${catParams}&search=${encodeURIComponent(query)}&searchin=1&incldead=0`;
   console.log(`[SEARCH] ${url}`);
 
   let html = "";
@@ -133,8 +134,10 @@ async function search(session, query, type = "movie") {
 }
 
 // ── Debug ─────────────────────────────────────────────────────────────────────
-async function debugSearch(session, query) {
-  const url = `${BROWSE_URL}?search=${encodeURIComponent(query)}&searchin=1&incldead=0`;
+async function debugSearch(session, query, cats) {
+  // Categories: 61 = Movies LT, 53 = Movies EN (verified working)
+  const catParams = (cats || [61,53]).map(c => "cat=" + c).join("&");
+  const url = `${BROWSE_URL}?${catParams}&search=${encodeURIComponent(query)}&searchin=1&incldead=0`;
   const resp = await session.client.get(url);
   return { html: resp.data, url };
 }
