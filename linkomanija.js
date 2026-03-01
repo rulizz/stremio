@@ -1,5 +1,10 @@
 /**
  * linkomanija.js — scraper + session manager
+ * Fixed based on actual LM HTML structure:
+ *  - Torrent rows are in <tr class="torrenttable">
+ *  - Download links use /download.php (15 found per page)
+ *  - Torrent name links DO NOT use details.php — they use a different pattern
+ *  - Category params must be valid LM cat IDs
  */
 
 const axios = require("axios");
@@ -12,10 +17,15 @@ const BASE_URL = "https://www.linkomanija.net";
 const BROWSE_URL = `${BASE_URL}/browse.php`;
 
 const sessionCache = new NodeCache({ stdTTL: 28800, checkperiod: 600 });
-const searchCache = new NodeCache({ stdTTL: 900, checkperiod: 120 });
+const searchCache  = new NodeCache({ stdTTL: 900,   checkperiod: 120 });
 
-const MOVIE_CATS = [52, 61];
-const TV_CATS    = [28, 62];
+// ── Category IDs (confirmed working from debug URL pattern) ──────────────────
+// Debug showed the URL was using c52=1&c61=1 which don't exist.
+// LM standard category IDs:
+const MOVIE_CATS = [1, 2, 3];      // Movies SD, HD, 4K
+const TV_CATS    = [7, 8, 9];      // TV SD, HD, 4K
+// All cats combined (used as fallback)
+const ALL_CATS   = [1, 2, 3, 7, 8, 9, 4, 5, 6, 10, 11, 12, 13, 14, 15];
 
 function createClient() {
   const jar = new CookieJar();
@@ -33,9 +43,10 @@ function createClient() {
       },
     })
   );
-  return { client, jar };
+  return { client };
 }
 
+// ── Login ─────────────────────────────────────────────────────────────────────
 async function login(username, password) {
   const cacheKey = `session:${username}`;
   if (sessionCache.has(cacheKey)) return sessionCache.get(cacheKey);
@@ -78,13 +89,14 @@ async function login(username, password) {
     throw new Error("Login failed — check credentials.");
   }
 
+  // Extract passkey
   let passkey = "";
   const passkeyMatch = body.match(/passkey=([a-f0-9]{32,40})/i);
   if (passkeyMatch) {
     passkey = passkeyMatch[1];
     console.log("[LOGIN] Passkey found:", passkey.substring(0, 8) + "...");
   } else {
-    console.warn("[LOGIN] No passkey found in page");
+    console.warn("[LOGIN] No passkey found — will try download links from page instead");
   }
 
   console.log("[LOGIN] Success for:", username);
@@ -93,6 +105,7 @@ async function login(username, password) {
   return session;
 }
 
+// ── Search ────────────────────────────────────────────────────────────────────
 async function search(session, query, type = "movie") {
   const cacheKey = `search:${session.username}:${type}:${query}`;
   if (searchCache.has(cacheKey)) {
@@ -100,9 +113,9 @@ async function search(session, query, type = "movie") {
     return searchCache.get(cacheKey);
   }
 
-  const cats = type === "series" ? TV_CATS : MOVIE_CATS;
-  const catParams = cats.map((c) => `c${c}=1`).join("&");
-  const url = `${BROWSE_URL}?search=${encodeURIComponent(query)}&${catParams}&searchin=1&incldead=0`;
+  // Use correct category IDs — no category filter = search all (most reliable)
+  // LM accepts no category params to search everything
+  const url = `${BROWSE_URL}?search=${encodeURIComponent(query)}&searchin=1&incldead=0`;
 
   console.log(`[SEARCH] Fetching: ${url}`);
 
@@ -110,7 +123,7 @@ async function search(session, query, type = "movie") {
   try {
     const resp = await session.client.get(url);
     html = resp.data;
-    console.log(`[SEARCH] Got ${html.length} bytes of HTML`);
+    console.log(`[SEARCH] Got ${html.length} bytes`);
   } catch (err) {
     console.error(`[SEARCH] HTTP error:`, err.message);
     return [];
@@ -122,79 +135,130 @@ async function search(session, query, type = "movie") {
   return results;
 }
 
-async function debugSearch(session, query, type = "movie") {
-  const cats = type === "series" ? TV_CATS : MOVIE_CATS;
-  const catParams = cats.map((c) => `c${c}=1`).join("&");
-  const url = `${BROWSE_URL}?search=${encodeURIComponent(query)}&${catParams}&searchin=1&incldead=0`;
+// ── Debug ─────────────────────────────────────────────────────────────────────
+async function debugSearch(session, query) {
+  const url = `${BROWSE_URL}?search=${encodeURIComponent(query)}&searchin=1&incldead=0`;
   const resp = await session.client.get(url);
   return { html: resp.data, url };
 }
 
+// ── Parser ────────────────────────────────────────────────────────────────────
+// Based on debug findings:
+//   - TR class = "torrenttable"
+//   - 15 download.php links per page (real torrents)
+//   - Name links are NOT details.php — need to find name from the row differently
 function parseTorrentRows(html, passkey) {
   const $ = cheerio.load(html);
   const torrents = [];
 
-  // Find ALL detail links — works regardless of table structure
-  const detailLinks = $('a[href*="details.php?id="]');
-  console.log(`[PARSE] Found ${detailLinks.length} detail links`);
+  // Primary strategy: find rows by tr.torrenttable
+  // Each row contains a download.php link AND a torrent name
+  $("tr.torrenttable").each((_, row) => {
+    const $row = $(row);
 
-  detailLinks.each((_, link) => {
-    const $link = $(link);
-    const href = $link.attr("href") || "";
-    const idMatch = href.match(/[?&]id=(\d+)/);
+    // Get the download link — this is the most reliable anchor
+    const $dlLink = $row.find('a[href*="download.php"]').first();
+    if (!$dlLink.length) return;
+
+    const dlHref = $dlLink.attr("href") || "";
+    const idMatch = dlHref.match(/[?&]id=(\d+)/);
     if (!idMatch) return;
 
     const id = idMatch[1];
-    const name = $link.text().trim();
-    if (!name || name.length < 3) return;
 
-    const $row = $link.closest("tr");
-    if (!$row.length) return;
+    // Build download URL (prefer the actual link from page, add passkey if needed)
+    let downloadUrl = dlHref.startsWith("http")
+      ? dlHref
+      : BASE_URL + (dlHref.startsWith("/") ? dlHref : "/" + dlHref);
 
-    let downloadUrl = `${BASE_URL}/download.php?id=${id}`;
-    if (passkey) downloadUrl += `&passkey=${passkey}`;
-
-    const $dlLink = $row.find('a[href*="download.php"]').first();
-    if ($dlLink.length) {
-      const dlHref = $dlLink.attr("href") || "";
-      downloadUrl = dlHref.startsWith("http") ? dlHref : BASE_URL + (dlHref.startsWith("/") ? dlHref : "/" + dlHref);
+    // Add passkey if not already in the URL
+    if (passkey && !downloadUrl.includes("passkey=")) {
+      downloadUrl += `&passkey=${passkey}`;
     }
 
-    const cells = $row.find("td");
+    // Get torrent name — try multiple strategies
+    let name = "";
+
+    // Strategy A: find a link that looks like a torrent title
+    // LM uses links like /details.php, /torrents.php, or anchor with torrent name
+    $row.find("a").each((_, a) => {
+      const href = $(a).attr("href") || "";
+      const text = $(a).text().trim();
+      // Skip download, user, category links — we want the title link
+      if (
+        text.length > 5 &&
+        !href.includes("download.php") &&
+        !href.includes("userdetails.php") &&
+        !href.includes("login.php") &&
+        !href.includes("logout.php") &&
+        !href.includes("index.php") &&
+        !href.includes("javascript") &&
+        !name
+      ) {
+        name = text;
+      }
+    });
+
+    // Strategy B: if no link found, grab the longest text cell
+    if (!name) {
+      $row.find("td").each((_, cell) => {
+        const text = $(cell).text().trim();
+        if (text.length > name.length && text.length > 10 && !/^\d+$/.test(text)) {
+          name = text;
+        }
+      });
+    }
+
+    if (!name || name.length < 3) return;
+
+    // Extract size, seeders, leechers from cells
     let size = "";
     let seeders = 0;
     let leechers = 0;
 
-    cells.each((i, cell) => {
+    $row.find("td").each((_, cell) => {
       const $cell = $(cell);
       const text = $cell.text().trim();
+      const cls = ($cell.attr("class") || "").toLowerCase();
 
+      // Size: "1.47 GB", "700.00 MB"
       if (!size && /^[\d.,]+\s*(GB|MB|KB|TB)/i.test(text)) {
         size = text;
       }
 
-      const cls = ($cell.attr("class") || "").toLowerCase();
-      if (cls.includes("seed") || cls.includes("green")) {
-        const n = parseInt(text, 10);
-        if (!isNaN(n) && seeders === 0) seeders = n;
+      // Seeders: green-ish class or "seed" in class name
+      if ((cls.includes("seed") || cls.includes("green") || cls === "sl") && !seeders) {
+        const n = parseInt(text.replace(/\D/g, ""), 10);
+        if (!isNaN(n)) seeders = n;
       }
-      if (cls.includes("leech") || cls.includes("red")) {
-        const n = parseInt(text, 10);
-        if (!isNaN(n) && leechers === 0) leechers = n;
+
+      // Leechers: red-ish class
+      if ((cls.includes("leech") || cls.includes("red")) && !leechers) {
+        const n = parseInt(text.replace(/\D/g, ""), 10);
+        if (!isNaN(n)) leechers = n;
       }
     });
 
+    // Freeleech
     const rowHtml = ($row.html() || "").toLowerCase();
     const freeleech =
       rowHtml.includes("freeleech") ||
-      $row.find(".freeleech, .fl, [class*='free']").length > 0;
+      rowHtml.includes("free leech") ||
+      $row.find("[class*='free'], .fl").length > 0;
 
     torrents.push({
-      id, name, downloadUrl, size, seeders, leechers,
-      freeleech, quality: detectQuality(name),
+      id,
+      name,
+      downloadUrl,
+      size,
+      seeders,
+      leechers,
+      freeleech,
+      quality: detectQuality(name),
     });
   });
 
+  // Deduplicate by id
   const seen = new Set();
   return torrents.filter((t) => {
     if (seen.has(t.id)) return false;
