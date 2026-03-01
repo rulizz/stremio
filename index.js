@@ -90,7 +90,7 @@ function buildStreams(torrents, title) {
       name: "LT Linkomanija\n" + t.quality + (t.freeleech ? " FL" : ""),
       description: t.name + "\n" + (t.size || "?") + " | Seeds: " + t.seeders + " | Leech: " + t.leechers,
       url: t.magnet, // direct magnet URI — Stremio handles this natively
-      behaviorHints: { notWebReady: true, bingeGroup: "lm-" + title },
+      behaviorHints: { bingeGroup: "lm-" + title },
     }));
 }
 
