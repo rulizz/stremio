@@ -18,12 +18,103 @@ async function getImdbTitle(imdbId, type) {
 }
 
 // ── Credentials ───────────────────────────────────────────────────────────────
-function encodeCredentials(username, password) {
-  return Buffer.from(JSON.stringify({ username, password })).toString("base64url");
+function encodeCredentials(username, password, rdKey) {
+  return Buffer.from(JSON.stringify({ username, password, rdKey: rdKey || "" })).toString("base64url");
 }
 function decodeCredentials(token) {
   try { return JSON.parse(Buffer.from(token, "base64url").toString("utf8")); }
   catch (e) { return null; }
+}
+
+// ── Real-Debrid API ───────────────────────────────────────────────────────────
+const RD_API = "https://api.real-debrid.com/rest/1.0";
+
+async function rdAddMagnet(rdKey, magnet) {
+  const resp = await axios.post(
+    RD_API + "/torrents/addMagnet",
+    "magnet=" + encodeURIComponent(magnet),
+    { headers: { Authorization: "Bearer " + rdKey, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 15000 }
+  );
+  return resp.data; // { id, uri }
+}
+
+async function rdSelectFiles(rdKey, torrentId) {
+  // Select all files
+  await axios.post(
+    RD_API + "/torrents/selectFiles/" + torrentId,
+    "files=all",
+    { headers: { Authorization: "Bearer " + rdKey, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 10000 }
+  );
+}
+
+async function rdGetTorrentInfo(rdKey, torrentId) {
+  const resp = await axios.get(
+    RD_API + "/torrents/info/" + torrentId,
+    { headers: { Authorization: "Bearer " + rdKey }, timeout: 10000 }
+  );
+  return resp.data; // { status, links, filename, ... }
+}
+
+async function rdUnrestrictLink(rdKey, link) {
+  const resp = await axios.post(
+    RD_API + "/unrestrict/link",
+    "link=" + encodeURIComponent(link),
+    { headers: { Authorization: "Bearer " + rdKey, "Content-Type": "application/x-www-form-urlencoded" }, timeout: 10000 }
+  );
+  return resp.data; // { download, filename, filesize, ... }
+}
+
+// Full flow: magnet → RD → direct stream URL
+// Returns array of { url, filename, filesize } or empty array if not ready
+async function rdResolve(rdKey, magnet) {
+  try {
+    // Step 1: add magnet to RD
+    const added = await rdAddMagnet(rdKey, magnet);
+    const torrentId = added.id;
+    if (!torrentId) throw new Error("No torrent ID from RD");
+
+    // Step 2: select all files
+    await rdSelectFiles(rdKey, torrentId);
+
+    // Step 3: poll for ready status (max 8 seconds)
+    let info;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await new Promise(r => setTimeout(r, 2000));
+      info = await rdGetTorrentInfo(rdKey, torrentId);
+      console.log("[RD] status=" + info.status + " id=" + torrentId);
+      if (info.status === "downloaded" || info.status === "cached") break;
+      if (info.status === "error" || info.status === "dead" || info.status === "magnet_error") {
+        throw new Error("RD torrent error: " + info.status);
+      }
+    }
+
+    if (!info || !info.links || info.links.length === 0) {
+      console.log("[RD] Not cached yet, returning magnet as fallback");
+      return [];
+    }
+
+    // Step 4: unrestrict the first video link
+    const videoLinks = info.links.slice(0, 3);
+    const results = [];
+    for (const link of videoLinks) {
+      try {
+        const unrestricted = await rdUnrestrictLink(rdKey, link);
+        if (unrestricted.download) {
+          results.push({
+            url: unrestricted.download,
+            filename: unrestricted.filename || info.filename || "video",
+            filesize: unrestricted.filesize || 0,
+          });
+        }
+      } catch (e) {
+        console.warn("[RD] Unrestrict failed for link:", e.message);
+      }
+    }
+    return results;
+  } catch (err) {
+    console.error("[RD] resolve error:", err.message);
+    return [];
+  }
 }
 
 // ── Parse torrent buffer → info hash → magnet URI ────────────────────────────
@@ -75,23 +166,34 @@ function buildMagnet(infoHash, name) {
 }
 
 // ── Build stream list ─────────────────────────────────────────────────────────
-// torrents must already have t.magnet resolved before calling this
 function buildStreams(torrents, title) {
-  return torrents
-    .filter(t => t.magnet) // only include torrents where magnet was resolved
-    .sort((a, b) => {
-      if (a.freeleech !== b.freeleech) return b.freeleech ? 1 : -1;
-      const q = s => s.includes("4K") ? 4 : s.includes("1080") ? 3 : s.includes("720") ? 2 : 1;
-      const qd = q(b.quality) - q(a.quality);
-      if (qd !== 0) return qd;
-      return b.seeders - a.seeders;
-    })
-    .map(t => ({
-      name: "LT Linkomanija\n" + t.quality + (t.freeleech ? " FL" : ""),
-      description: t.name + "\n" + (t.size || "?") + " | Seeds: " + t.seeders + " | Leech: " + t.leechers,
-      url: t.magnet, // direct magnet URI — Stremio handles this natively
+  const streams = [];
+  for (const t of torrents) {
+    if (!t.magnet) continue;
+    const label = "LT Linkomanija\n" + t.quality + (t.freeleech ? " FL" : "");
+    const desc = t.name + "\n" + (t.size || "?") + " | Seeds: " + t.seeders + " | Leech: " + t.leechers;
+
+    // If RD resolved direct links, add those first (instant play)
+    if (t.rdStreams && t.rdStreams.length > 0) {
+      for (const rd of t.rdStreams) {
+        streams.push({
+          name: label + " RD",
+          description: desc + "\n⚡ Real-Debrid — " + rd.filename,
+          url: rd.url,
+          behaviorHints: { bingeGroup: "lm-" + title },
+        });
+      }
+    }
+
+    // Always also add the magnet as fallback
+    streams.push({
+      name: label,
+      description: desc,
+      url: t.magnet,
       behaviorHints: { bingeGroup: "lm-" + title },
-    }));
+    });
+  }
+  return streams;
 }
 
 // ── Resolve magnets for a list of torrents ────────────────────────────────────
@@ -149,9 +251,9 @@ app.use((req, res, next) => {
 app.get("/", (req, res) => res.redirect("/configure"));
 app.get("/configure", (req, res) => res.send(configurePage()));
 app.post("/configure", (req, res) => {
-  const { username, password } = req.body;
+  const { username, password, rdKey } = req.body;
   if (!username || !password) return res.send(configurePage("Username and password are required."));
-  const token = encodeCredentials(username.trim(), password);
+  const token = encodeCredentials(username.trim(), password, (rdKey || "").trim());
   const manifestUrl = ADDON_URL + "/" + token + "/manifest.json";
   const host = new URL(ADDON_URL).host;
   const stremioUrl = "stremio://" + host + "/" + token + "/manifest.json";
@@ -209,11 +311,26 @@ app.get("/:token/stream/:type/:id.json", async (req, res) => {
       if (results.length > 0) { console.log("[STREAM] " + results.length + " results for: " + query); break; }
     }
 
-    // Resolve magnet links for top results (limit to 10 to stay within timeout)
+    // Resolve magnet links for top results
     const topResults = results.slice(0, 10);
     const withMagnets = await resolveMagnets(session, topResults);
+
+    // If user has RD key, resolve magnets to direct streams in parallel
+    if (creds.rdKey) {
+      console.log("[RD] Resolving " + withMagnets.filter(t => t.magnet).length + " magnets via Real-Debrid");
+      await Promise.all(
+        withMagnets
+          .filter(t => t.magnet)
+          .slice(0, 5) // limit RD calls to top 5
+          .map(async t => {
+            t.rdStreams = await rdResolve(creds.rdKey, t.magnet);
+            if (t.rdStreams.length > 0) console.log("[RD] " + t.id + " -> " + t.rdStreams.length + " direct streams");
+          })
+      );
+    }
+
     const streams = buildStreams(withMagnets, title);
-    console.log("[STREAM] Returning " + streams.length + " streams with magnets");
+    console.log("[STREAM] Returning " + streams.length + " streams");
     res.json({ streams });
   } catch (err) {
     console.error("[STREAM ERROR]", err.message);
@@ -456,6 +573,8 @@ function configurePage(error) {
     "<form method='POST' action='/configure'>" +
     "<label>Username</label><input type='text' name='username' placeholder='your_username' autocomplete='username' required/>" +
     "<label>Password</label><input type='password' name='password' placeholder='••••••••' autocomplete='current-password' required/>" +
+    "<label>Real-Debrid API Key <span style=\'font-weight:300;text-transform:none\'>— optional, for instant streaming</span></label>" +
+    "<input type='text' name='rdKey' placeholder='your RD API key (real-debrid.com/apitoken)'/>" +
     "<button type='submit'>Generate My Addon URL →</button>" +
     "</form>" +
     "<p class='note'>Requires <a href='https://www.linkomanija.net' target='_blank'>Linkomanija.net</a> account.<br/>Credentials encoded in URL — never stored.</p>" +
