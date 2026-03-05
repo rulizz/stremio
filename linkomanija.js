@@ -2,7 +2,7 @@
  * linkomanija.js — scraper + session manager
  * Selectors confirmed from live HTML debug:
  *
- * <tr class="torrenttable">
+ * <tr class="torrenttable"> (or other row classes — we match by download link presence)
  *   td[0] = category icon
  *   td[1] = torrent name + download link + bookmark
  *   td[2] = file count
@@ -118,7 +118,10 @@ function relevanceScore(torrentName, query) {
   const queryWords = q.split(" ").filter(w => w.length > 0);
 
   // All query words must appear somewhere in the torrent name
-  const allMatch = queryWords.every(w => nameWords.some(nw => nw.includes(w)));
+  // Numbers and short words (<=2 chars) must match exactly to avoid "2" matching "2001"
+  const allMatch = queryWords.every(w => nameWords.some(nw =>
+    (/^\d+$/.test(w) || w.length <= 2) ? nw === w : nw.includes(w)
+  ));
   if (!allMatch) return 0;
 
   // Score: bonus if name starts with query, small penalty for extra words
@@ -177,7 +180,7 @@ function parseTorrentRows(html, passkey) {
   const $ = cheerio.load(html);
   const torrents = [];
 
-  $("tr.torrenttable").each((_, row) => {
+  $('tr:has(a[href*="download.php"])').each((_, row) => {
     const $row = $(row);
     const cells = $row.find("td");
     if (cells.length < 9) return; // need all 9 columns
